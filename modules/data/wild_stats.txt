@@ -1,0 +1,3 @@
+encounters=88
+shinies=13
+sinceshiny=7
