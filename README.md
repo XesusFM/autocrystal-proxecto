@@ -314,12 +314,18 @@ During playback, every step must match its recorded map and coordinates. Wild
 encounters are resolved and the interrupted waypoint resumes afterward. Any
 blocked step, unexpected position, unsupported interaction, missing Master Ball,
 or unconfirmed capture pauses the campaign instead of guessing another input.
+If an encounter interrupts one half of the back-and-forth hunt movement, the
+campaign resolves the battle first and then walks back to the saved hunt anchor
+before hunting or route playback continues. This recovery is limited to the
+same map and at most two verified tiles; a larger displacement pauses for manual
+inspection. Encounters remain untouched while the editor or a user-requested
+manual pause is active.
 
 **Run campaign** and **Resume** request one BizHawk unpause so automation does
 not silently wait behind an emulator pause. With **Verbose Logging** enabled,
 the Lua Output and campaign status show whether movement is waiting for a wild
 battle to finish, valid map coordinates, or the short overworld settle window.
-A successful current load prints `[Campaign] Loaded campaign-r11` in the Lua Output; the
+A successful current load prints `[Campaign] Loaded campaign-r12` in the Lua Output; the
 launcher clears stale Campaign modules before their first load.
 
 The launcher's **Stop** button is cooperative during Route Campaign: movement,

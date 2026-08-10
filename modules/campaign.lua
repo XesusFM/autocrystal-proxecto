@@ -18,8 +18,10 @@ local WildEngine = require("wild_engine")
 local PokemonNames = require("data.pokemon_names")
 local Stats = require("data.stats")
 
-local RUNTIME_REVISION = "campaign-r11"
+local RUNTIME_REVISION = "campaign-r12"
 local DISCORD_RELAY_URL = "http://127.0.0.1:5000/"
+local MAX_ANCHOR_RECOVERY_DISTANCE = 2
+local MAX_ANCHOR_RECOVERY_FAILURES = 3
 local MAP_GROUP_ADDR = 0xDCB5
 local MAP_NUMBER_ADDR = 0xDCB6
 local Y_COORD_ADDR = 0xDCB7
@@ -42,6 +44,9 @@ local capture
 local mode = "editor"
 local resumeMode = nil
 local pausedReason = nil
+local pauseKind = nil
+local campaignActive = false
+local encounterContextMode = nil
 local profiles = {}
 local profile = nil
 local progress = nil
@@ -58,6 +63,7 @@ local home = nil
 local movementFailures = 0
 local routeRetries = 0
 local recording = nil
+local anchorRecovery = nil
 local overworldSettleUntilFrame = 0
 local lastMovementGateMessage = nil
 local lastMovementGateLogFrame = 0
@@ -110,6 +116,23 @@ end
 local function position_text(value)
     if value == nil then return "-" end
     return string.format("map %d/%d X=%d Y=%d", value.mapGroup, value.mapNumber, value.x, value.y)
+end
+
+local function copy_position(value)
+    if value == nil then return nil end
+    return {
+        mapGroup = value.mapGroup,
+        mapNumber = value.mapNumber,
+        x = value.x,
+        y = value.y,
+    }
+end
+
+local function position_distance(a, b)
+    if a == nil or b == nil or a.mapGroup ~= b.mapGroup or a.mapNumber ~= b.mapNumber then
+        return nil
+    end
+    return math.abs(a.x - b.x) + math.abs(a.y - b.y)
 end
 
 local function press_button(button)
@@ -300,6 +323,15 @@ end
 
 local function set_mode(next_mode, status)
     mode = next_mode
+    if mode == "hunting" or mode == "traveling" then
+        campaignActive = true
+    elseif mode == "editor" or mode == "completed" then
+        campaignActive = false
+    end
+    if mode ~= "paused" then
+        pausedReason = nil
+        pauseKind = nil
+    end
     if capture ~= nil then
         local stage = current_stage()
         capture:set_hunting(mode == "hunting", stage and stage.anchor or nil)
@@ -316,11 +348,25 @@ local function set_mode(next_mode, status)
     if status then CampaignGui.set_status(panel, status) end
 end
 
-local function pause(reason, return_mode)
+local function pause(reason, return_mode, kind)
     resumeMode = return_mode or mode
     pausedReason = reason
+    pauseKind = kind or "automatic"
     set_mode("paused", "PAUSED: " .. tostring(reason))
     send_discord_notification("Route Campaign paused: " .. tostring(reason))
+end
+
+local function schedule_anchor_recovery(target)
+    if target == nil then return end
+    anchorRecovery = {
+        target = copy_position(target),
+        failures = 0,
+    }
+    safePair = nil
+end
+
+local function clear_anchor_recovery()
+    anchorRecovery = nil
 end
 
 local function reset_movement(stage)
@@ -328,6 +374,72 @@ local function reset_movement(stage)
     movementFailures = 0
     routeRetries = 0
     home = stage and stage.anchor or nil
+end
+
+local function anchor_recovery_step()
+    if anchorRecovery == nil then return end
+    local target = anchorRecovery.target
+    local here = position()
+    local distance = position_distance(here, target)
+
+    if same_position(here, target) then
+        clear_anchor_recovery()
+        movementFailures = 0
+        routeRetries = 0
+        local status = mode == "traveling"
+            and "Hunt anchor restored. Resuming route..."
+            or "Hunt anchor restored. Resuming hunting..."
+        CampaignGui.set_status(panel, status)
+        return
+    end
+    if distance == nil then
+        clear_anchor_recovery()
+        pause("Cannot recover hunt anchor from another map. Expected "
+            .. position_text(target) .. ", got " .. position_text(here), mode)
+        return
+    end
+    if distance > MAX_ANCHOR_RECOVERY_DISTANCE then
+        clear_anchor_recovery()
+        pause(string.format("Hunt anchor recovery distance is %d tiles; maximum is %d. Expected %s, got %s",
+            distance, MAX_ANCHOR_RECOVERY_DISTANCE, position_text(target), position_text(here)), mode)
+        return
+    end
+
+    local direction
+    if here.x < target.x then
+        direction = "Right"
+    elseif here.x > target.x then
+        direction = "Left"
+    elseif here.y < target.y then
+        direction = "Down"
+    else
+        direction = "Up"
+    end
+
+    local result, after = attempt_step(direction, false)
+    if result == "cancelled" then return end
+    if result == "encounter" then
+        -- Keep the same target. The encounter is resolved first and this
+        -- recovery resumes after the overworld stabilizes again.
+        return
+    end
+
+    local after_distance = position_distance(after, target)
+    if result == "moved" and after_distance ~= nil and after_distance < distance then
+        anchorRecovery.failures = 0
+        CampaignGui.set_status(panel, "Returning to hunt anchor: " .. position_text(target))
+        return
+    end
+
+    anchorRecovery.failures = anchorRecovery.failures + 1
+    if anchorRecovery.failures >= MAX_ANCHOR_RECOVERY_FAILURES then
+        clear_anchor_recovery()
+        pause("Could not return to the hunt anchor after 3 verified attempts", mode)
+    else
+        CampaignGui.set_status(panel, string.format(
+            "Anchor recovery blocked; retry %d/%d",
+            anchorRecovery.failures, MAX_ANCHOR_RECOVERY_FAILURES))
+    end
 end
 
 local function find_safe_pair()
@@ -350,7 +462,10 @@ local function hunt_step()
     if safePair == nil then
         local pair, reason = find_safe_pair()
         if reason == "cancelled" then return end
-        if reason == "encounter" then return end
+        if reason == "encounter" then
+            schedule_anchor_recovery(home)
+            return
+        end
         safePair = pair
         if safePair == nil then
             movementFailures = movementFailures + 1
@@ -366,10 +481,16 @@ local function hunt_step()
 
     local out_result = attempt_step(safePair.out, false)
     if out_result == "cancelled" then return end
-    if out_result == "encounter" then return end
+    if out_result == "encounter" then
+        schedule_anchor_recovery(home)
+        return
+    end
     local back_result = attempt_step(safePair.back, false)
     if back_result == "cancelled" then return end
-    if back_result == "encounter" then return end
+    if back_result == "encounter" then
+        schedule_anchor_recovery(home)
+        return
+    end
     if out_result ~= "moved" or back_result ~= "moved" or not same_position(position(), home) then
         safePair = nil
         movementFailures = movementFailures + 1
@@ -517,6 +638,9 @@ local function begin_campaign()
         return
     end
 
+    campaignActive = true
+    clear_anchor_recovery()
+    encounterContextMode = nil
     local next_mode = progress.status == "traveling" and "traveling" or "hunting"
     local expected
     if next_mode == "traveling" then
@@ -536,10 +660,11 @@ local function begin_campaign()
     set_mode(next_mode, next_mode == "traveling" and "Resuming saved route..." or "Hunting at " .. current_stage().name)
 end
 
-local function record_capture(event)
+local function record_capture(event, context_mode)
     local encounter = event.encounter
     local stage = current_stage()
-    local completes_target = mode == "hunting" and stage ~= nil
+    context_mode = context_mode or mode
+    local completes_target = context_mode == "hunting" and stage ~= nil
         and is_target(stage, encounter.species) and not target_is_complete(stage, encounter.species)
 
     if completes_target then
@@ -552,7 +677,7 @@ local function record_capture(event)
             mapGroup = read_byte(MAP_GROUP_ADDR),
             mapNumber = read_byte(MAP_NUMBER_ADDR),
             caughtAt = os.time(),
-            duringTravel = mode == "traveling",
+            duringTravel = context_mode == "traveling",
         })
     end
 
@@ -562,6 +687,7 @@ local function record_capture(event)
 
     if completes_target and stage_is_complete(stage) then
         if progress.currentStage >= #profile.stages then
+            clear_anchor_recovery()
             progress.status = "completed"
             save_progress()
             refresh_progress_display()
@@ -579,9 +705,9 @@ local function record_capture(event)
         return
     end
 
-    if mode == "traveling" then
+    if context_mode == "traveling" then
         progress.status = "traveling"
-    elseif mode == "hunting" then
+    elseif context_mode == "hunting" then
         progress.status = "hunting"
     end
     save_progress()
@@ -593,6 +719,20 @@ end
 local function handle_capture_event(event)
     if event.type == "encounter" then
         local e = event.encounter
+        local context_mode = mode
+        if mode == "paused" and campaignActive and pauseKind ~= "manual"
+            and (resumeMode == "hunting" or resumeMode == "traveling") then
+            -- A battle hook can stabilize just after a movement mismatch was
+            -- observed. Automatic campaign pauses must not strand that battle:
+            -- restore its logical mode, resolve it, then revalidate movement.
+            context_mode = resumeMode
+            if context_mode == "hunting" then
+                local stage = current_stage()
+                schedule_anchor_recovery(home or (stage and stage.anchor))
+            end
+            set_mode(context_mode, "Encounter interrupted movement; resolving it safely...")
+        end
+        encounterContextMode = context_mode
         sessionEncounterCount = sessionEncounterCount + 1
         Stats.record_encounter()
         Gui.update_last_encounter(hud, sessionEncounterCount, e.species, e.speciesName,
@@ -624,13 +764,25 @@ local function handle_capture_event(event)
             if not ok then pause(err, mode) end
         end
     elseif event.type == "fled" then
+        local context_mode = encounterContextMode or mode
+        if context_mode == "hunting" then
+            local stage = current_stage()
+            schedule_anchor_recovery(home or (stage and stage.anchor))
+        end
         safePair = nil
         overworldSettleUntilFrame = emu.framecount() + 10
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny,
-            sessionEncounterCount, mode == "traveling" and "Route resumed" or "Hunting resumed")
+            sessionEncounterCount, context_mode == "traveling" and "Route resumed" or "Hunting resumed")
+        encounterContextMode = nil
     elseif event.type == "captured" then
+        local context_mode = encounterContextMode or mode
+        if context_mode == "hunting" then
+            local stage = current_stage()
+            schedule_anchor_recovery(home or (stage and stage.anchor))
+        end
         overworldSettleUntilFrame = emu.framecount() + 10
-        record_capture(event)
+        record_capture(event, context_mode)
+        encounterContextMode = nil
     elseif event.type == "paused" or event.type == "error" then
         pause(event.reason or event.type, mode)
     end
@@ -741,19 +893,26 @@ local function handle_action(action)
     elseif action == "run_campaign" then
         begin_campaign()
     elseif action == "pause_campaign" then
-        pause("Paused by user", mode)
+        pause("Paused by user", mode, "manual")
     elseif action == "resume_campaign" or action == "retry_checkpoint" then
         if mode ~= "paused" then return end
         local next_mode = resumeMode or (progress and progress.status) or "hunting"
         ensure_emulation_running()
         set_mode(next_mode, "Retrying " .. next_mode .. "...")
         if capture:is_in_battle() and capture.currentEncounter then
+            encounterContextMode = next_mode
+            if next_mode == "hunting" then
+                local stage = current_stage()
+                schedule_anchor_recovery(home or (stage and stage.anchor))
+            end
             local requested, err = capture:request_action(
                 capture.currentEncounter.shiny and "capture_master_ball" or "flee")
             if not requested then pause(err, next_mode) end
         end
     elseif action == "back_to_editor" then
         recording = nil
+        clear_anchor_recovery()
+        encounterContextMode = nil
         set_mode("editor", "Editor ready. Current game position was not changed.")
     end
 end
@@ -805,6 +964,10 @@ end
 
 function M.on_stop()
     joypad.set({})
+    campaignActive = false
+    pauseKind = nil
+    clear_anchor_recovery()
+    encounterContextMode = nil
     if capture ~= nil then capture:set_hunting(false) end
 end
 
@@ -813,6 +976,9 @@ function M.on_resume()
     sessionEncounterCount = 0
     finishRequested = false
     recording = nil
+    campaignActive = false
+    encounterContextMode = nil
+    clear_anchor_recovery()
     pendingConfirmation = nil
     overworldSettleUntilFrame = 0
     lastMovementGateMessage = nil
@@ -879,6 +1045,9 @@ function M.step()
         end
     elseif mode == "recording" then
         recorder_step()
+    elseif anchorRecovery ~= nil and movement_mode and overworld_ready
+        and emu.framecount() >= overworldSettleUntilFrame then
+        anchor_recovery_step()
     elseif mode == "hunting" and overworld_ready and emu.framecount() >= overworldSettleUntilFrame then
         hunt_step()
     elseif mode == "traveling" and overworld_ready and emu.framecount() >= overworldSettleUntilFrame then
